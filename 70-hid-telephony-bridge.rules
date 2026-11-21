@@ -1,0 +1,3 @@
+# Grant the active local user access to the Shure MV7+ (14ed:1019).
+# Set the tag before 73-seat-late.rules applies the ACL.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="14ed", ATTRS{idProduct}=="1019", TAG+="uaccess"

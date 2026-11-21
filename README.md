@@ -1,198 +1,88 @@
 # hid-telephony-bridge
 
-Bridges USB microphone hardware mute buttons to Linux desktops via **USB HID Telephony**. Press the button on the mic, and PipeWire mutes — the GNOME microphone indicator updates, the mute LED on the mic lights up, and apps actually stop receiving audio. Muting from the desktop side (GNOME settings, `pactl`, etc.) syncs back to the LED.
+Enables USB telephony mode so the **Shure MV7+** can mute itself promptly when you tap its LED bar. The daemon sends Off-Hook (report `0x05`), listens for mute button presses (report `0x04`), and turns Off-Hook off when stopped. The mic controls its own audio and mute LED. The daemon reconnects when you unplug and replug the mic.
 
-Default device: **Shure MV7+**. Configurable for any USB mic implementing HID Telephony Page (0x0B) via `--vid`/`--pid`.
+## Install on Arch
 
-## The problem
+### Build a package from this checkout
 
-Many USB microphones with mute buttons — the Shure MV7+, Elgato Wave, Blue Yeti X, and others — implement the **USB HID Telephony Page (0x0B)**. This is the same protocol that Teams, Zoom, and other UC apps use on Windows and macOS to sync call state with headsets and mics.
+With Arch's base-devel installed, run this as your regular user from the checkout:
 
-The protocol requires a **handshake**: the host must send an "Off-Hook" signal before the device will report button events. On Windows, UC apps do this automatically via the Windows Telephony API. On macOS, CoreAudio handles it. **On Linux, nothing implements the host side** — so the mute button silently does nothing.
-
-The mic still works as an audio device. It's just that the mute button, which physically exists and has an LED, is completely ignored by the OS.
-
-## How it works
-
-```
-                             Off-Hook ON (report 0x05)
-                ┌──────────────────────────────────────────┐
-                │                                          ▼
-        ┌───────────────┐                          ┌──────────────┐
-        │               │   Phone Mute pressed     │              │
-        │    Bridge     │◄─────────────────────────│   MV7+ HID   │
-        │    daemon     │     (report 0x04)        │   (hidraw)   │
-        │               │                          │              │
-        │               │   Mute LED sync          │              │
-        │               │─────────────────────────►│              │
-        └───────┬───────┘     (report 0x06)        └──────────────┘
-                │
-                │  pactl set-source-mute
-                ▼
-        ┌───────────────┐
-        │   PipeWire    │──► GNOME mic indicator
-        │   source      │──► Application audio
-        └───────────────┘
+```bash
+HID_TELEPHONY_BRIDGE_LOCAL_BUILD=1 makepkg -si
 ```
 
-1. Sends **Off-Hook** (Report 0x05) to activate telephony mode
-2. Reads **Phone Mute** toggle events (Report 0x04) from the hidraw device
-3. Toggles PipeWire source mute via `pactl`
-4. Syncs the **Mute LED** (Report 0x06) bidirectionally — button press or desktop mute both update it
+This builds the package from the files in the checkout and installs it with pacman. Replug the MV7+ to apply the udev rule, then start the user service:
 
-The daemon polls PipeWire state every 500ms to catch mute changes from the desktop side.
+```bash
+systemctl --user enable --now hid-telephony-bridge.service
+```
 
-### Hot-plug support
+### Install directly
 
-The daemon handles USB disconnect and reconnect automatically. If the mic is unplugged, it polls for the device with exponential backoff (2s → 30s cap) until it reappears — no manual service restart needed. This is handled entirely in userspace because Linux udev (which detects hardware events) runs as root and cannot directly trigger systemd *user* services.
+Run from this checkout as your regular user in an active local session:
 
-## Requirements
+```bash
+bash ./install.sh
+systemctl --user status hid-telephony-bridge.service
+```
 
-- Linux with PipeWire (any distro — Arch, Fedora, Ubuntu 22.04+, etc.)
-- Python 3.8+ (stdlib only, no pip dependencies)
-- `pactl` (from `pipewire-pulse` or `libpulse`)
-- A USB microphone with HID Telephony support (tested: Shure MV7+)
+The installer uses `sudo` to copy the script and service and install a udev rule for the MV7+ (USB ID `14ed:1019`). The rule grants the active local user access to the mic's `hidraw` interface. The service runs as your user and starts at login. The bridge itself requires only Python 3.8+ and its standard library.
 
-## Installation
+Make a local recording and tap mute, unmute, and mute again to check when the audio cuts out.
 
 ### Arch Linux (AUR)
 
+For tagged releases, install through the AUR and enable the user service:
+
 ```bash
-yay -S hid-telephony-bridge      # or: paru -S hid-telephony-bridge
-sudo usermod -aG input $USER     # then re-login, or: newgrp input
-systemctl --user enable --now hid-telephony-bridge
+yay -S hid-telephony-bridge
+systemctl --user enable --now hid-telephony-bridge.service
 ```
 
-To uninstall cleanly, **stop the service first** (pacman runs as root and can't touch user services):
+Replug the mic if the rule has just been installed and the service reports a permission error. To uninstall the package, stop the service first:
 
 ```bash
-systemctl --user disable --now hid-telephony-bridge
+systemctl --user disable --now hid-telephony-bridge.service
 yay -Rns hid-telephony-bridge
 ```
 
-If you forget and the daemon keeps running from the now-deleted binary (systemd holds the file descriptor), run `systemctl --user kill hid-telephony-bridge` to clean it up.
+### Upgrade from a previous source install
 
-### From source
+If you installed the old rule at `/etc/udev/rules.d/99-hid-telephony-bridge.rules`, remove that legacy rule and replug the mic after installing the new version. Remove `--auto-offhook` or `--hid-only` from any existing command or systemd drop-in. Hardware mute is now the default.
 
-```bash
-git clone https://github.com/fuxx/hid-telephony-bridge.git
-cd hid-telephony-bridge
-chmod +x install.sh
-./install.sh
-```
+## Foreground test
 
-The install script will:
-- Install the bridge script to `/usr/bin/` (needs sudo)
-- Install a udev rule granting the `input` group access to the hidraw device
-- Add your user to the `input` group if needed (re-login or `newgrp input` to apply)
-- Install and enable a systemd user service
-
-### Manual setup
-
-If you prefer to set things up yourself:
+Stop the service if it is running, then run the bridge from the checkout:
 
 ```bash
-# 1. udev rule for hidraw permissions
-sudo install -Dm644 99-hid-telephony-bridge.rules /etc/udev/rules.d/99-hid-telephony-bridge.rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=hidraw
-
-# 2. Add yourself to the input group (then re-login, or: newgrp input)
-sudo usermod -aG input $USER
-
-# 3. Test it
 python3 hid-telephony-bridge.py --verbose
-
-# 4. Install as a systemd user service
-sudo install -Dm755 hid-telephony-bridge.py /usr/bin/hid-telephony-bridge
-sudo install -Dm644 hid-telephony-bridge.service /usr/lib/systemd/user/hid-telephony-bridge.service
-systemctl --user daemon-reload
-systemctl --user enable --now hid-telephony-bridge
 ```
 
-## Usage
-
-Once installed, the service starts automatically with your desktop session (bound to `pipewire-pulse.service`). It will auto-detect the device on any hidraw node.
+Look for `Off-Hook ON` and `Mute button pressed`. Press `Ctrl+C` to stop. Use `--device /dev/hidrawN` to select a particular node for the first connection. The device needs read/write access for the handshake.
 
 ```bash
-# Check status
-systemctl --user status hid-telephony-bridge
-
-# Watch logs
-journalctl --user -u hid-telephony-bridge -f
-
-# Restart after a config change
-systemctl --user restart hid-telephony-bridge
+journalctl --user -u hid-telephony-bridge.service -f
+systemctl --user disable --now hid-telephony-bridge.service
 ```
 
-### Options
-
-```
-hid-telephony-bridge [--vid VID] [--pid PID] [--device /dev/hidrawN] [--auto-offhook] [--verbose]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--vid` | USB Vendor ID in hex (default: `14ed` for Shure) |
-| `--pid` | USB Product ID in hex (default: `1019` for MV7+) |
-| `--device` | Force a specific hidraw path instead of auto-detecting |
-| `--auto-offhook` | Only activate telephony mode when an app is capturing audio (adds ~2s latency) |
-| `--verbose` | Debug logging |
-
-To enable auto-offhook mode permanently, use a systemd drop-in:
-
-```bash
-systemctl --user edit hid-telephony-bridge.service
-```
-
-Then add:
-
-```ini
-[Service]
-ExecStart=
-ExecStart=/usr/bin/hid-telephony-bridge --auto-offhook --verbose
-```
+The first command follows the service log. The second stops the service and disables it at login.
 
 ## Other devices
 
-The daemon should work with any USB microphone that implements HID Telephony Page (0x0B) with the standard report layout (reports 0x04/0x05/0x06). To use it with a different device:
+Some microphones may support the same Off-Hook and Phone Mute reports. Hardware mute in this mode has been tested on the MV7+.
 
-1. **Find your device's USB IDs** — plug in the mic and run:
-   ```bash
-   lsusb
-   ```
-   Look for your device in the output. The VID:PID pair is in the `ID` column:
-   ```
-   Bus 005 Device 005: ID 14ed:1019 Shure Inc Shure MV7+
-                           ^^^^:^^^^
-                           VID   PID
-   ```
+1. Use `lsusb` to find the device's vendor and product IDs.
+2. Copy [the MV7+ udev rule](70-hid-telephony-bridge.rules) to `/etc/udev/rules.d/70-my-telephony-mic.rules` and replace the IDs. Reload the rules with `sudo udevadm control --reload-rules`, then replug the mic.
+3. Run `systemctl --user edit hid-telephony-bridge.service` and add the following, substituting the IDs:
 
-2. **Add a udev rule for your device.** The package ships a rule only for the MV7+. Create a new file in `/etc/udev/rules.d/` (admin path — do not edit the one in `/usr/lib/udev/rules.d/`, which is package-managed):
-   ```bash
-   sudo tee /etc/udev/rules.d/90-my-telephony-mic.rules <<EOF
-   SUBSYSTEM=="hidraw", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="XXXX", MODE="0660", GROUP="input", TAG+="uaccess"
-   EOF
-   sudo udevadm control --reload-rules
-   sudo udevadm trigger --subsystem-match=hidraw
-   ```
-
-3. **Override VID/PID** via systemd drop-in:
-   ```bash
-   systemctl --user edit hid-telephony-bridge.service
-   ```
    ```ini
    [Service]
    ExecStart=
-   ExecStart=/usr/bin/hid-telephony-bridge --vid XXXX --pid XXXX --verbose
+   ExecStart=/usr/bin/hid-telephony-bridge --vid XXXX --pid XXXX
    ```
 
-Without the udev rule, the hidraw node for your device will be `root:root 0600` and the daemon will fail with permission denied.
-
-If your device uses different HID report IDs, please open an issue with the output of:
-```bash
-sudo usbhid-dump -d XXXX:XXXX -e descriptor
-```
+   Restart the user service after saving.
 
 ## Releasing / AUR publishing
 
@@ -225,17 +115,6 @@ The script will:
 - Ask for confirmation before pushing to the AUR git repo
 
 This ensures the tarball GitHub serves hasn't been tampered with between CI build and AUR publish. No secrets or SSH keys are stored in GitHub.
-
-## Related projects
-
-**[cakenes/shure-mv6-mute-sync](https://github.com/cakenes/shure-mv6-mute-sync)** solves the same problem for the Shure MV6. It uses a kernel HID module to read/write the mic's mute state via USB Audio Class 2 (UAC2) control messages, plus a userspace C daemon for PipeWire sync.
-
-Both the MV6 and MV7+ expose mute through the same UAC2 Feature Unit structure (`Microphone Capture Switch` in ALSA). The MV7+ mute button also works autonomously via UAC2 — pressing it updates the ALSA control and the LED without any HID Telephony involvement. A simpler ALSA↔PipeWire mute bridge would also be a viable approach for this project. The current release uses HID Telephony, which gives instant LED control from the host side.
-
-## Roadmap
-
-1. **HID-BPF program** — a BPF program that handles the Off-Hook handshake in-kernel and emits `KEY_MICMUTE` via the input subsystem. No daemon needed — GNOME, KDE, and other desktops already handle `KEY_MICMUTE` natively. Requires `CONFIG_HID_BPF=y` (available since kernel 6.3, enabled by default on Arch 6.8+). This would be strictly better than both the userspace daemon and the out-of-tree kernel module approach.
-2. **ALSA↔PipeWire mute bridge** — an alternative simpler architecture that syncs ALSA `Microphone Capture Switch` to PipeWire source mute. Would work for any USB mic with an autonomous mute button, without hidraw access or device-specific config.
 
 ## License
 
